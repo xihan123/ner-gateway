@@ -1,0 +1,33 @@
+services:
+  ner-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ner-gateway:latest
+    container_name: ner-gateway
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models/ner_model_int8.onnx:/app/models/ner_model_int8.onnx:ro
+      - ./models/vocab.txt:/app/models/vocab.txt:ro
+      - ./backend/index.html:/app/index.html:ro
+      - ner-data:/app/data
+    environment:
+      - NER_PORT=8080
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+volumes:
+  ner-data:
+    driver: local

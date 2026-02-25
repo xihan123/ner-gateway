@@ -1,0 +1,23 @@
+[project]
+name = "ner-training"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.5.0",
+    "transformers>=4.45.0",
+    "datasets>=3.0.0",
+    "evaluate>=0.4.0",
+    "seqeval>=0.0.12",
+    "scikit-learn>=1.5.0",
+    "accelerate>=1.0.0",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

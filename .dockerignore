@@ -1,0 +1,36 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Rust build artifacts
+backend/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Data files (mounted at runtime)
+models/
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Training
+training/
+
+# Other
+.env
+*.md
+*.log
+uv.lock
+pyproject.toml
+docker-compose.yml
