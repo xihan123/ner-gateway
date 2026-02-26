@@ -92,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         // API routes
         .route("/api/extract", post(handlers::extract))
         .route("/api/reviews", get(handlers::get_reviews))
+        .route("/api/reviews/filter", get(handlers::get_filtered_reviews))
         .route("/api/reviews/all", get(handlers::get_all_reviews))
         .route("/api/reviews/{id}", post(handlers::update_review))
         .route("/api/stats", get(handlers::get_stats))

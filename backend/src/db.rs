@@ -248,6 +248,112 @@ impl Repository {
         Ok(reviews)
     }
     
+    /// Count all reviews with optional status filter
+    pub fn count_all(&self, status: Option<ReviewStatus>) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        
+        let sql = match status {
+            Some(_) => "SELECT COUNT(*) FROM review_data WHERE status = ?1",
+            None => "SELECT COUNT(*) FROM review_data",
+        };
+        
+        let count: i64 = match status {
+            Some(s) => conn.query_row(sql, params![s], |r| r.get(0))?,
+            None => conn.query_row(sql, [], |r| r.get(0))?,
+        };
+        
+        Ok(count as usize)
+    }
+    
+    /// Get filtered reviews with advanced filtering options
+    pub fn get_filtered(&self, filter: &ReviewFilter) -> Result<Vec<ReviewData>> {
+        let conn = self.conn.lock().unwrap();
+        
+        let mut sql = String::from(
+            "SELECT id, original_text, text_hash, confidence, predicted_names, status, review_note, corrected_names, created_at, updated_at FROM review_data WHERE 1=1"
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        
+        // Status filter
+        if let Some(status) = &filter.status {
+            sql.push_str(" AND status = ?");
+            param_values.push(Box::new(status.as_str().to_string()));
+        }
+        
+        // Confidence range filter
+        if let Some(min) = filter.confidence_min {
+            sql.push_str(" AND confidence >= ?");
+            param_values.push(Box::new(min));
+        }
+        if let Some(max) = filter.confidence_max {
+            sql.push_str(" AND confidence <= ?");
+            param_values.push(Box::new(max));
+        }
+        
+        // Has names filter (check if predicted_names is not empty array)
+        if let Some(has_names) = filter.has_names {
+            if has_names {
+                // Has names: predicted_names is not '[]'
+                sql.push_str(" AND predicted_names != '[]' AND predicted_names IS NOT NULL");
+            } else {
+                // No names: predicted_names is '[]' or NULL
+                sql.push_str(" AND (predicted_names = '[]' OR predicted_names IS NULL)");
+            }
+        }
+        
+        sql.push_str(" ORDER BY created_at DESC LIMIT ? OFFSET ?");
+        param_values.push(Box::new(filter.limit as i64));
+        param_values.push(Box::new(filter.offset as i64));
+        
+        let params: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|v| v.as_ref()).collect();
+        
+        let mut stmt = conn.prepare(&sql)?;
+        let reviews = stmt
+            .query_map(params.as_slice(), ReviewData::from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        
+        Ok(reviews)
+    }
+    
+    /// Get count of filtered reviews (for pagination)
+    pub fn count_filtered(&self, filter: &ReviewFilter) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        
+        let mut sql = String::from("SELECT COUNT(*) FROM review_data WHERE 1=1");
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        
+        // Status filter
+        if let Some(status) = &filter.status {
+            sql.push_str(" AND status = ?");
+            param_values.push(Box::new(status.as_str().to_string()));
+        }
+        
+        // Confidence range filter
+        if let Some(min) = filter.confidence_min {
+            sql.push_str(" AND confidence >= ?");
+            param_values.push(Box::new(min));
+        }
+        if let Some(max) = filter.confidence_max {
+            sql.push_str(" AND confidence <= ?");
+            param_values.push(Box::new(max));
+        }
+        
+        // Has names filter
+        if let Some(has_names) = filter.has_names {
+            if has_names {
+                sql.push_str(" AND predicted_names != '[]' AND predicted_names IS NOT NULL");
+            } else {
+                sql.push_str(" AND (predicted_names = '[]' OR predicted_names IS NULL)");
+            }
+        }
+        
+        let params: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|v| v.as_ref()).collect();
+        
+        let count: i64 = conn.query_row(&sql, params.as_slice(), |r| r.get(0))?;
+        
+        Ok(count as usize)
+    }
+    
     /// Update review status
     pub fn update_status(
         &self,
@@ -309,6 +415,17 @@ pub struct NewReviewData {
     pub text_hash: String,
     pub predicted_names: Vec<String>,
     pub confidence: f64,
+}
+
+/// Filter options for reviewing queries
+#[derive(Debug, Clone, Default)]
+pub struct ReviewFilter {
+    pub status: Option<ReviewStatus>,
+    pub confidence_min: Option<f64>,
+    pub confidence_max: Option<f64>,
+    pub has_names: Option<bool>,
+    pub limit: usize,
+    pub offset: usize,
 }
 
 /// Thread-safe repository wrapper

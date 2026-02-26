@@ -9,7 +9,7 @@ use axum::{
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::db::{hash_text, NewReviewData, RepositorySync, ReviewData, ReviewStatus};
+use crate::db::{hash_text, NewReviewData, RepositorySync, ReviewData, ReviewFilter, ReviewStatus};
 use crate::engine::NEREngineSync;
 use crate::error::{AppError, Result};
 
@@ -78,8 +78,16 @@ pub struct ReviewUpdateRequest {
 #[derive(Debug, Deserialize)]
 pub struct ReviewsQuery {
     pub status: Option<String>,
+    /// Minimum confidence (0.0 - 1.0)
+    pub confidence_min: Option<f64>,
+    /// Maximum confidence (0.0 - 1.0)
+    pub confidence_max: Option<f64>,
+    /// Filter by whether names were extracted (true = has names, false = no names)
+    pub has_names: Option<bool>,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
 }
 
 fn default_limit() -> usize {
@@ -137,7 +145,7 @@ pub async fn extract(
     }))
 }
 
-/// GET /api/reviews - Get pending reviews
+/// GET /api/reviews - Get pending reviews (backward compatible)
 pub async fn get_reviews(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
     let reviews = state.repo.inner().get_pending(50)?;
     let items: Vec<ReviewItem> = reviews.into_iter().map(ReviewItem::from).collect();
@@ -148,17 +156,62 @@ pub async fn get_reviews(State(state): State<AppState>) -> Result<Json<serde_jso
     })))
 }
 
+/// GET /api/reviews/filter - Get reviews with advanced filtering
+pub async fn get_filtered_reviews(
+    State(state): State<AppState>,
+    Query(query): Query<ReviewsQuery>,
+) -> Result<Json<serde_json::Value>> {
+    // Validate and clamp limit
+    let limit = query.limit.min(500).max(1);
+    let offset = query.offset;
+    
+    let filter = ReviewFilter {
+        status: query.status.and_then(|s| ReviewStatus::from_str(&s)),
+        confidence_min: query.confidence_min,
+        confidence_max: query.confidence_max,
+        has_names: query.has_names,
+        limit,
+        offset,
+    };
+    
+    let reviews = state.repo.inner().get_filtered(&filter)?;
+    let items: Vec<ReviewItem> = reviews.into_iter().map(ReviewItem::from).collect();
+    
+    // Get total count for pagination info
+    let total_count = state.repo.inner().count_filtered(&filter)?;
+    
+    Ok(Json(serde_json::json!({
+        "count": items.len(),
+        "total": total_count,
+        "offset": offset,
+        "limit": limit,
+        "has_more": (offset + items.len()) < total_count,
+        "items": items
+    })))
+}
+
 /// GET /api/reviews/all - Get all reviews
 pub async fn get_all_reviews(
     State(state): State<AppState>,
     Query(query): Query<ReviewsQuery>,
 ) -> Result<Json<serde_json::Value>> {
+    // Validate and clamp limit
+    let limit = query.limit.min(500).max(1);
+    let offset = query.offset;
+    
     let status = query.status.and_then(|s| ReviewStatus::from_str(&s));
-    let reviews = state.repo.inner().get_all(status, query.limit)?;
+    let reviews = state.repo.inner().get_all(status, limit)?;
     let items: Vec<ReviewItem> = reviews.into_iter().map(ReviewItem::from).collect();
+    
+    // Get total count for pagination info
+    let total_count = state.repo.inner().count_all(status)?;
     
     Ok(Json(serde_json::json!({
         "count": items.len(),
+        "total": total_count,
+        "offset": offset,
+        "limit": limit,
+        "has_more": (offset + items.len()) < total_count,
         "items": items
     })))
 }
@@ -184,9 +237,6 @@ pub async fn update_review(
     let (status, corrected_names) = match req.action.as_str() {
         "approve" => (ReviewStatus::Approved, Some(review.predicted_names.as_slice())),
         "correct" => {
-            if req.names.is_empty() {
-                return Err(AppError::BadRequest("names required for correct action".into()));
-            }
             (ReviewStatus::Corrected, Some(req.names.as_slice()))
         }
         "reject" => (ReviewStatus::Rejected, None),
