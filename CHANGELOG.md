@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/xihan123/ner-gateway/compare/v1.1.0...v1.2.0) (2026-02-26)
+
+
+### Features
+
+* **db:** 添加高级筛选、分页功能、统计查询支持 ([ffc608a](https://github.com/xihan123/ner-gateway/commit/ffc608a15efccc05f94f1e7487f144429b74a997))
+
 ## [1.1.0](https://github.com/xihan123/ner-gateway/compare/v1.0.0...v1.1.0) (2026-02-25)
 
 
