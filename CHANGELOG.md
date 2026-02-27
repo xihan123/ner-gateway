@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/xihan123/ner-gateway/compare/v1.2.0...v1.3.0) (2026-02-27)
+
+
+### Features
+
+* **engine:** 添加姓名验证和清理功能以提高实体提取准确性 ([289343d](https://github.com/xihan123/ner-gateway/commit/289343d29d9492a40fd44eb64e4f8df33d5e9110))
+
 ## [1.2.0](https://github.com/xihan123/ner-gateway/compare/v1.1.0...v1.2.0) (2026-02-26)
 
 
