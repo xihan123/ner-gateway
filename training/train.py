@@ -38,10 +38,12 @@ def get_device():
 MODEL_NAME = "uer/roberta-medium-wwm-chinese-cluecorpussmall"
 # 多数据源支持（按优先级顺序加载，自动合并）
 DATA_PATHS = [
-	"./bio_data.jsonl",  # AI 生成的客服场景数据
-	"./bio_name_corpus.jsonl",  # 姓名语料库数据（中文+英文名）
+	"../data/bio_data.jsonl",  # AI 生成的客服场景数据
+	"../data/bio_name_corpus.jsonl",  # 姓名语料库数据（中文+英文名）
+	"../data/training_data.jsonl",  # 实际业务数据
+	"../data/negative_samples.jsonl",  # 负样本（修复误识别）
 ]
-OUTPUT_DIR = "./best_ner_model"
+OUTPUT_DIR = "../models/best_ner_model"
 
 # 标签映射
 LABEL_LIST = ["O", "B-PER", "I-PER"]
@@ -49,12 +51,12 @@ LABEL2ID = {label: i for i, label in enumerate(LABEL_LIST)}
 ID2LABEL = {i: label for i, label in enumerate(LABEL_LIST)}
 
 # 超参数（优化后）
-BATCH_SIZE = 16                    # 降低 batch size，配合梯度累积
-LEARNING_RATE = 2e-5               # 稍微降低学习率
-NUM_EPOCHS = 15                    # 减少 epochs，配合早停
-MAX_LENGTH = 128                   # 姓名识别任务 128 足够
-GRADIENT_ACCUMULATION_STEPS = 2    # 梯度累积，有效 batch = 32
-MAX_SAMPLES = 80000                # 最大样本数，避免数据过量
+BATCH_SIZE = 16  # 降低 batch size，配合梯度累积
+LEARNING_RATE = 2e-5  # 稍微降低学习率
+NUM_EPOCHS = 15  # 减少 epochs，配合早停
+MAX_LENGTH = 128  # 姓名识别任务 128 足够
+GRADIENT_ACCUMULATION_STEPS = 2  # 梯度累积，有效 batch = 32
+MAX_SAMPLES = 80000  # 最大样本数，避免数据过量
 
 
 def load_jsonl_data(file_paths: list, max_samples: int = None) -> list:

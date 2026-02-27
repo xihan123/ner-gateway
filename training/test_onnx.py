@@ -165,7 +165,7 @@ else:
 
 # 加载模型
 session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-tokenizer = AutoTokenizer.from_pretrained("./best_ner_model")
+tokenizer = AutoTokenizer.from_pretrained("../models/best_ner_model")
 
 # 测试文本（包含长文本）
 raw_text = """
@@ -228,11 +228,29 @@ for i, pred_id in enumerate(predictions):
 if current_type is not None:
 	entities.append((text[current_start:current_end], current_type))
 
+
+def is_valid_entity(text: str) -> bool:
+	"""检查实体是否有效（非空白、非纯标点）"""
+	if not text or not text.strip():
+		return False
+	# 检查是否包含有效字符（非空白、非标点）
+	for ch in text:
+		# 中文字符或其他 Unicode 字符
+		if not ch.isascii() and not ch.isspace():
+			return True
+		# ASCII 字母数字
+		if ch.isascii() and ch.isalnum():
+			return True
+	# 所有字符都是空白或标点
+	return False
+
+
 # 去重并显示
 seen = set()
 if entities:
 	for entity_text, entity_type in entities:
-		if entity_text and entity_text not in seen:
+		# 过滤无效实体（空白字符、标点等）
+		if entity_text and is_valid_entity(entity_text) and entity_text not in seen:
 			seen.add(entity_text)
 			type_name = {"PER": "人名"}.get(entity_type, entity_type)
 			print(f"  [{type_name}] \033[92m{entity_text}\033[0m")
