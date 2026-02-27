@@ -334,6 +334,22 @@ pub async fn health_check(State(state): State<AppState>) -> Result<Json<serde_js
     })))
 }
 
+/// Check if a name is valid (contains non-whitespace, non-punctuation characters)
+fn is_valid_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    
+    name.chars().any(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
+}
+
+/// Clean name by removing whitespace and invalid characters
+fn clean_name_for_bio(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
+        .collect()
+}
+
 /// Convert text and names to BIO tags
 fn text_to_bio_tags(text: &str, names: &[String]) -> (Vec<String>, Vec<String>) {
     // Clean HTML tags
@@ -345,11 +361,13 @@ fn text_to_bio_tags(text: &str, names: &[String]) -> (Vec<String>, Vec<String>) 
     
     // Set BIO tags for each name
     for name in names {
-        if name.is_empty() {
+        // Clean and validate name
+        let cleaned_name = clean_name_for_bio(name);
+        if !is_valid_name(&cleaned_name) {
             continue;
         }
         
-        let name_chars: Vec<char> = name.chars().collect();
+        let name_chars: Vec<char> = cleaned_name.chars().collect();
         if name_chars.is_empty() {
             continue;
         }

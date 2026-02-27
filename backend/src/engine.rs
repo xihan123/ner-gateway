@@ -145,6 +145,39 @@ impl NEREngine {
     }
 }
 
+/// Check if a string is a valid person name (not whitespace, punctuation, or other invalid chars)
+fn is_valid_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    
+    // Check each character
+    for ch in name.chars() {
+        // Skip whitespace (space, tab, newline, etc.)
+        if ch.is_whitespace() {
+            continue;
+        }
+        
+        // Skip common punctuation and symbols
+        if ch.is_ascii_punctuation() {
+            continue;
+        }
+        
+        // Valid character found
+        return true;
+    }
+    
+    // All characters were whitespace or punctuation
+    false
+}
+
+/// Clean name by removing whitespace and invalid characters from edges
+fn clean_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
+        .collect()
+}
+
 /// Extract person names from tokens based on BIO predictions
 fn extract_entities(tokens: &[String], predictions: &[i32]) -> Vec<String> {
     let mut names = Vec::new();
@@ -156,31 +189,39 @@ fn extract_entities(tokens: &[String], predictions: &[i32]) -> Vec<String> {
             break;
         }
         
+        let token = &tokens[i];
+        
         match pred {
             LABEL_BPER => {
                 // Start of new entity
-                if in_entity && !current_name.is_empty() {
-                    names.push(current_name.clone());
+                if in_entity && is_valid_name(&current_name) {
+                    let cleaned = clean_name(&current_name);
+                    if is_valid_name(&cleaned) {
+                        names.push(cleaned);
+                    }
                 }
                 current_name.clear();
-                current_name.push_str(&tokens[i]);
+                current_name.push_str(token);
                 in_entity = true;
             }
             LABEL_IPER => {
                 // Continuation of entity
                 if in_entity {
-                    current_name.push_str(&tokens[i]);
+                    current_name.push_str(token);
                 } else {
                     // I-PER without B-PER, treat as B-PER
                     current_name.clear();
-                    current_name.push_str(&tokens[i]);
+                    current_name.push_str(token);
                     in_entity = true;
                 }
             }
             LABEL_O | _ => {
                 // End of entity
-                if in_entity && !current_name.is_empty() {
-                    names.push(current_name.clone());
+                if in_entity && is_valid_name(&current_name) {
+                    let cleaned = clean_name(&current_name);
+                    if is_valid_name(&cleaned) {
+                        names.push(cleaned);
+                    }
                     current_name.clear();
                 }
                 in_entity = false;
@@ -189,14 +230,17 @@ fn extract_entities(tokens: &[String], predictions: &[i32]) -> Vec<String> {
     }
     
     // Don't forget the last entity
-    if in_entity && !current_name.is_empty() {
-        names.push(current_name);
+    if in_entity && is_valid_name(&current_name) {
+        let cleaned = clean_name(&current_name);
+        if is_valid_name(&cleaned) {
+            names.push(cleaned);
+        }
     }
     
     // Deduplicate
     let mut seen = std::collections::HashSet::new();
     names.into_iter()
-        .filter(|n| !n.is_empty() && seen.insert(n.clone()))
+        .filter(|n| is_valid_name(n) && seen.insert(n.clone()))
         .collect()
 }
 
