@@ -338,6 +338,17 @@ jobs:
           - 主程序二进制文件
           - ONNX Runtime 动态库（需要与主程序放在同一目录）
 
+          **ONNX Runtime 下载地址** (v${{ env.ONNX_RUNTIME_VERSION }})：
+
+          CPU 版本（默认）：
+          - Windows x64: https://github.com/microsoft/onnxruntime/releases/download/v${{ env.ONNX_RUNTIME_VERSION }}/onnxruntime-win-x64-${{ env.ONNX_RUNTIME_VERSION }}.zip
+          - macOS ARM64: https://github.com/microsoft/onnxruntime/releases/download/v${{ env.ONNX_RUNTIME_VERSION }}/onnxruntime-osx-arm64-${{ env.ONNX_RUNTIME_VERSION }}.tgz
+          - Linux x64: https://github.com/microsoft/onnxruntime/releases/download/v${{ env.ONNX_RUNTIME_VERSION }}/onnxruntime-linux-x64-${{ env.ONNX_RUNTIME_VERSION }}.tgz
+
+          GPU 版本（如需 GPU 加速）：
+          - Windows x64 (CUDA): https://github.com/microsoft/onnxruntime/releases/download/v${{ env.ONNX_RUNTIME_VERSION }}/onnxruntime-win-x64-gpu-${{ env.ONNX_RUNTIME_VERSION }}.zip
+          - Linux x64 (CUDA): https://github.com/microsoft/onnxruntime/releases/download/v${{ env.ONNX_RUNTIME_VERSION }}/onnxruntime-linux-x64-gpu-${{ env.ONNX_RUNTIME_VERSION }}.tgz
+
           ### 校验
 
           ```bash
