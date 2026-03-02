@@ -364,8 +364,8 @@ jobs:
           **Windows:**
           ```powershell
           # 确保 onnxruntime.dll 与 ner-gateway.exe 在同一目录
-          set NER_MODEL_PATH=./models/ner_model_int8.onnx
-          set NER_VOCAB_PATH=./models/vocab.txt
+          set NER_MODEL_PATH=./models/onnx_ner_model_fp16/model.onnx
+          set NER_VOCAB_PATH=./models/onnx_ner_model_fp16/vocab.txt
           .\ner-gateway-windows-x64.exe
           ```
 
@@ -373,7 +373,7 @@ jobs:
           ```bash
           # 确保 libonnxruntime.* 与 ner-gateway 在同一目录
           chmod +x ner-gateway-*
-          NER_MODEL_PATH=./models/ner_model_int8.onnx NER_VOCAB_PATH=./models/vocab.txt ./ner-gateway-*
+          NER_MODEL_PATH=./models/onnx_ner_model_fp16/model.onnx NER_VOCAB_PATH=./models/onnx_ner_model_fp16/vocab.txt ./ner-gateway-*
           ```
 
           ### Docker

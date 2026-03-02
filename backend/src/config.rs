@@ -26,7 +26,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model_path: PathBuf::from("./models/onnx_ner_model_fp16/model_quantized.onnx"),
+            model_path: PathBuf::from("./models/onnx_ner_model_fp16/model.onnx"),
             vocab_path: PathBuf::from("./models/onnx_ner_model_fp16/vocab.txt"),
             db_path: PathBuf::from("./ner_reviews.db"),
             port: DEFAULT_PORT,
