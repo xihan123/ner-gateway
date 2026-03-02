@@ -10,6 +10,9 @@ dependencies = [
     "seqeval>=0.0.12",
     "scikit-learn>=1.5.0",
     "accelerate>=1.0.0",
+    "optimum>=1.23.0",
+    "onnxruntime>=1.24.0",
+    "onnx>=1.17.0",
 ]
 
 [tool.uv.sources]
