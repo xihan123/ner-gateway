@@ -1,25 +1,20 @@
-//! Application configuration
-
 use std::path::PathBuf;
 
-/// Model configuration constants
 pub const MAX_SEQ_LENGTH: usize = 512;
+
+#[allow(dead_code)]
 pub const NUM_LABELS: usize = 3;
 
-/// Special token IDs
 pub const UNK_TOKEN_ID: i64 = 100;
 pub const CLS_TOKEN_ID: i64 = 101;
 pub const SEP_TOKEN_ID: i64 = 102;
 
-/// Label IDs for BIO tagging
 pub const LABEL_O: i32 = 0;
 pub const LABEL_BPER: i32 = 1;
 pub const LABEL_IPER: i32 = 2;
 
-/// Default server port
 pub const DEFAULT_PORT: u16 = 8080;
 
-/// Application configuration
 #[derive(Debug, Clone)]
 pub struct Config {
     pub model_path: PathBuf,
@@ -31,8 +26,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model_path: PathBuf::from("./models/ner_model_int8.onnx"),
-            vocab_path: PathBuf::from("./models/vocab.txt"),
+            model_path: PathBuf::from("./models/onnx_ner_model_fp16/model_quantized.onnx"),
+            vocab_path: PathBuf::from("./models/onnx_ner_model_fp16/vocab.txt"),
             db_path: PathBuf::from("./ner_reviews.db"),
             port: DEFAULT_PORT,
         }
@@ -40,7 +35,6 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Create config from environment variables
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
