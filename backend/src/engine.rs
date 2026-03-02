@@ -1,14 +1,80 @@
-//! ONNX Runtime NER inference engine
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use std::sync::Arc;
-
-use ort::{inputs, session::Session, value::Tensor};
-
-use crate::config::{LABEL_BPER, LABEL_IPER, LABEL_O, MAX_SEQ_LENGTH, NUM_LABELS};
+use crate::config::{LABEL_BPER, LABEL_IPER, LABEL_O, MAX_SEQ_LENGTH};
 use crate::error::Result;
 use crate::tokenizer::Tokenizer;
+use ndarray::Array2;
+use ort::ep::CUDA;
+use ort::{session::builder::GraphOptimizationLevel, session::Session, value::TensorRef};
 
-/// NER inference result
+#[cfg(target_os = "windows")]
+fn add_cuda_dll_search_paths() {
+    use std::env;
+
+    let cuda_paths = [
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\x64",
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin\x64",
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin",
+        r"C:\Program Files\NVIDIA\CUDNN\v9.19\bin\13.1\x64",
+        r"C:\Program Files\NVIDIA\CUDNN\v9.19\bin\12.9\x64",
+        r"C:\Program Files\NVIDIA\CUDNN\v9.18\bin\13.1\x64",
+        r"C:\Program Files\NVIDIA\CUDNN\v9.18\bin\12.9\x64",
+        r"C:\Program Files\NVIDIA\CUDNN\v9.17\bin\13.1\x64",
+        r"C:\Program Files\NVIDIA\CUDNN\v9.16\bin\13.1\x64",
+    ];
+
+    let current_path = env::var("PATH").unwrap_or_default();
+    let mut new_paths: Vec<String> = Vec::new();
+
+    for path in &cuda_paths {
+        if std::path::Path::new(path).exists() {
+            if !current_path.to_lowercase().contains(&path.to_lowercase()) {
+                new_paths.push(path.to_string());
+                tracing::info!("Adding to PATH: {}", path);
+            }
+        }
+    }
+
+    if !new_paths.is_empty() {
+        let new_path = new_paths.join(";");
+        let updated_path = if current_path.is_empty() {
+            new_path
+        } else {
+            format!("{};{}", new_path, current_path)
+        };
+
+        unsafe {
+            use std::ffi::OsStr;
+            use std::os::windows::ffi::OsStrExt;
+
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn SetEnvironmentVariableW(name: *const u16, value: *const u16) -> i32;
+            }
+
+            let name: Vec<u16> = OsStr::new("PATH")
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let value: Vec<u16> = OsStr::new(&updated_path)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let result = SetEnvironmentVariableW(name.as_ptr(), value.as_ptr());
+            if result != 0 {
+                tracing::info!("Updated PATH with {} CUDA/cuDNN directories", new_paths.len());
+            } else {
+                tracing::warn!("Failed to update PATH environment variable");
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn add_cuda_dll_search_paths() {}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct InferenceResult {
@@ -18,46 +84,93 @@ pub struct InferenceResult {
     pub tokens: Vec<String>,
 }
 
-/// NER Engine wrapper for ONNX Runtime
 pub struct NEREngine {
-    session: Arc<std::sync::Mutex<Session>>,
+    session: Mutex<Session>,
     tokenizer: Tokenizer,
+    using_gpu: bool,
 }
 
 impl NEREngine {
-    /// Create a new NER engine
     pub fn new(model_path: &std::path::Path, vocab_path: &std::path::Path) -> Result<Self> {
+        add_cuda_dll_search_paths();
+
         tracing::info!("Loading model from: {:?}", model_path);
-        
-        // Load tokenizer
+
         let tokenizer = Tokenizer::from_file(vocab_path)?;
-        
-        // Create ONNX session
-        let session = Session::builder()?
-            .with_intra_threads(4)?
-            .commit_from_file(model_path)?;
-        
-        // Log model info
-        tracing::info!("Model inputs:");
-        for input in session.inputs() {
-            tracing::info!("  - {}", input.name());
-        }
-        tracing::info!("Model outputs:");
-        for output in session.outputs() {
-            tracing::info!("  - {}", output.name());
-        }
-        
-        Ok(Self { 
-            session: Arc::new(std::sync::Mutex::new(session)), 
-            tokenizer 
+
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        let disable_cuda = std::env::var("NER_DISABLE_CUDA")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
+
+        let (session, using_gpu) = if disable_cuda {
+            tracing::info!("CUDA disabled by environment variable NER_DISABLE_CUDA");
+            let session = Session::builder()?
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .with_intra_threads(num_threads)?
+                .commit_from_file(model_path)?;
+            (session, false)
+        } else {
+            match Self::try_create_gpu_session(model_path, num_threads) {
+                Ok((session, true)) => (session, true),
+                _ => {
+                    tracing::warn!("GPU not available, falling back to CPU");
+                    let session = Session::builder()?
+                        .with_optimization_level(GraphOptimizationLevel::Level3)?
+                        .with_intra_threads(num_threads)?
+                        .commit_from_file(model_path)?;
+                    (session, false)
+                }
+            }
+        };
+
+        tracing::info!(
+            "Model loaded. Threads: {}, GPU: {}",
+            num_threads,
+            if using_gpu { "YES" } else { "NO" }
+        );
+        Ok(Self {
+            session: Mutex::new(session),
+            tokenizer,
+            using_gpu,
         })
     }
-    
-    /// Perform NER prediction on text
+
+    fn try_create_gpu_session(model_path: &std::path::Path, num_threads: usize) -> Result<(Session, bool)> {
+        let builder = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_intra_threads(num_threads)?;
+
+        match builder.with_execution_providers([CUDA::default().build()]) {
+            Ok(b) => {
+                tracing::info!("CUDA execution provider registered");
+                if let Ok(device_id) = ort::ep::get_gpu_device() {
+                    tracing::info!("GPU device ID: {}", device_id);
+                }
+                let session = b.commit_from_file(model_path)?;
+                Ok((session, true))
+            }
+            Err(e) => {
+                tracing::debug!("CUDA registration failed: {:?}", e);
+                Err(e.into())
+            }
+        }
+    }
+
+    pub fn is_using_gpu(&self) -> bool {
+        self.using_gpu
+    }
+
     pub fn predict(&self, text: &str) -> Result<InferenceResult> {
-        // Tokenize
+        let total_start = Instant::now();
+
+        let tokenize_start = Instant::now();
         let input = self.tokenizer.prepare_for_model(text, MAX_SEQ_LENGTH);
-        
+        let tokenize_time = tokenize_start.elapsed();
+
         if input.input_ids.is_empty() {
             return Ok(InferenceResult {
                 names: vec![],
@@ -66,76 +179,81 @@ impl NEREngine {
                 tokens: vec![],
             });
         }
-        
+
         let seq_len = input.input_ids.len();
-        
-        // Create input tensors using tuple format (shape, data)
-        let shape = [1usize, seq_len];
-        
-        let input_ids_tensor = Tensor::from_array((
-            shape,
-            input.input_ids.clone().into_boxed_slice()
-        ))?;
-        
-        let attention_mask_tensor = Tensor::from_array((
-            shape,
-            input.attention_mask.clone().into_boxed_slice()
-        ))?;
-        
-        let token_type_ids_tensor = Tensor::from_array((
-            shape,
-            input.token_type_ids.clone().into_boxed_slice()
-        ))?;
-        
-        // Run inference
+
+        let input_ids_array = Array2::from_shape_vec((1, seq_len), input.input_ids).unwrap();
+        let attention_mask_array = Array2::from_shape_vec((1, seq_len), input.attention_mask).unwrap();
+        let token_type_ids_array = Array2::from_shape_vec((1, seq_len), input.token_type_ids).unwrap();
+
+        let input_ids_tensor = TensorRef::from_array_view(input_ids_array.view())?;
+        let attention_mask_tensor = TensorRef::from_array_view(attention_mask_array.view())?;
+        let token_type_ids_tensor = TensorRef::from_array_view(token_type_ids_array.view())?;
+
         let mut session = self.session.lock().unwrap();
-        let outputs = session.run(inputs![
-            "input_ids" => &input_ids_tensor,
-            "attention_mask" => &attention_mask_tensor,
-            "token_type_ids" => &token_type_ids_tensor,
+
+        let inference_start = Instant::now();
+        let outputs = session.run(ort::inputs![
+            "input_ids" => input_ids_tensor,
+            "attention_mask" => attention_mask_tensor,
+            "token_type_ids" => token_type_ids_tensor,
         ])?;
-        
-        // Extract output tensor
-        let output = &outputs[0];
-        let output_array = output.try_extract_array::<f32>()?;
-        
-        // Output shape: [1, seq_len, 3]
-        // Process predictions
+        let inference_time = inference_start.elapsed();
+
+        let logits_3d = outputs["logits"]
+            .try_extract_array::<f32>()?
+            .into_dimensionality::<ndarray::Ix3>()
+            .unwrap();
+
         let mut predictions = Vec::with_capacity(seq_len - 2);
-        let mut confidences = Vec::with_capacity(seq_len - 2);
-        
-        // Skip [CLS] and [SEP]
+        let mut sum_confidence = 0.0;
+        let mut valid_tokens_count = 0;
+
         for i in 1..(seq_len - 1) {
-            let mut logits = [0.0f32; NUM_LABELS];
-            for j in 0..NUM_LABELS {
-                logits[j] = output_array[[0, i, j]];
+            let token_logits = logits_3d.slice(ndarray::s![0, i, ..]);
+
+            let mut max_logit = f32::NEG_INFINITY;
+            let mut pred_idx = 0;
+
+            for (idx, &val) in token_logits.iter().enumerate() {
+                if val > max_logit {
+                    max_logit = val;
+                    pred_idx = idx;
+                }
             }
-            
-            // Softmax
-            let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let sum_exp: f32 = logits.iter().map(|&x| (x - max_logit).exp()).sum();
-            
-            let (pred_idx, &max_logit_val) = logits
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .unwrap();
-            
+
             predictions.push(pred_idx as i32);
-            let prob = (max_logit_val - max_logit).exp() / sum_exp;
-            confidences.push(prob as f64);
+
+            if pred_idx != LABEL_O as usize {
+                let sum_exp: f32 = token_logits.iter().map(|&x| (x - max_logit).exp()).sum();
+                let prob = 1.0 / sum_exp;
+                sum_confidence += prob as f64;
+                valid_tokens_count += 1;
+            }
         }
-        
-        // Extract named entities
+
         let names = extract_entities(&input.tokens, &predictions);
-        
-        // Calculate average confidence
-        let avg_confidence = if confidences.is_empty() {
+
+        let avg_confidence = if valid_tokens_count == 0 {
             1.0
         } else {
-            confidences.iter().sum::<f64>() / confidences.len() as f64
+            sum_confidence / valid_tokens_count as f64
         };
-        
+
+        let total_time = total_start.elapsed();
+
+        if !names.is_empty() || tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                "Inference: tokenize={:?}, inference={:?}, total={:?}, device={}, seq_len={}, names={:?}",
+                tokenize_time,
+                inference_time,
+                total_time,
+                if self.using_gpu { "GPU" } else { "CPU" },
+                seq_len,
+                names
+            );
+        }
+
         Ok(InferenceResult {
             names,
             confidence: avg_confidence,
@@ -145,55 +263,43 @@ impl NEREngine {
     }
 }
 
-/// Check if a string is a valid person name (not whitespace, punctuation, or other invalid chars)
 fn is_valid_name(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    
-    // Check each character
+
     for ch in name.chars() {
-        // Skip whitespace (space, tab, newline, etc.)
         if ch.is_whitespace() {
             continue;
         }
-        
-        // Skip common punctuation and symbols
         if ch.is_ascii_punctuation() {
             continue;
         }
-        
-        // Valid character found
         return true;
     }
-    
-    // All characters were whitespace or punctuation
     false
 }
 
-/// Clean name by removing whitespace and invalid characters from edges
 fn clean_name(name: &str) -> String {
     name.chars()
         .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
         .collect()
 }
 
-/// Extract person names from tokens based on BIO predictions
 fn extract_entities(tokens: &[String], predictions: &[i32]) -> Vec<String> {
     let mut names = Vec::new();
     let mut current_name = String::new();
     let mut in_entity = false;
-    
+
     for (i, &pred) in predictions.iter().enumerate() {
         if i >= tokens.len() {
             break;
         }
-        
+
         let token = &tokens[i];
-        
+
         match pred {
             LABEL_BPER => {
-                // Start of new entity
                 if in_entity && is_valid_name(&current_name) {
                     let cleaned = clean_name(&current_name);
                     if is_valid_name(&cleaned) {
@@ -205,18 +311,15 @@ fn extract_entities(tokens: &[String], predictions: &[i32]) -> Vec<String> {
                 in_entity = true;
             }
             LABEL_IPER => {
-                // Continuation of entity
                 if in_entity {
                     current_name.push_str(token);
                 } else {
-                    // I-PER without B-PER, treat as B-PER
                     current_name.clear();
                     current_name.push_str(token);
                     in_entity = true;
                 }
             }
             LABEL_O | _ => {
-                // End of entity
                 if in_entity && is_valid_name(&current_name) {
                     let cleaned = clean_name(&current_name);
                     if is_valid_name(&cleaned) {
@@ -228,23 +331,21 @@ fn extract_entities(tokens: &[String], predictions: &[i32]) -> Vec<String> {
             }
         }
     }
-    
-    // Don't forget the last entity
+
     if in_entity && is_valid_name(&current_name) {
         let cleaned = clean_name(&current_name);
         if is_valid_name(&cleaned) {
             names.push(cleaned);
         }
     }
-    
-    // Deduplicate
+
     let mut seen = std::collections::HashSet::new();
-    names.into_iter()
+    names
+        .into_iter()
         .filter(|n| is_valid_name(n) && seen.insert(n.clone()))
         .collect()
 }
 
-/// Thread-safe wrapper for NER engine
 #[derive(Clone)]
 pub struct NEREngineSync(Arc<NEREngine>);
 
@@ -252,8 +353,12 @@ impl NEREngineSync {
     pub fn new(engine: NEREngine) -> Self {
         Self(Arc::new(engine))
     }
-    
+
     pub fn predict(&self, text: &str) -> Result<InferenceResult> {
         self.0.predict(text)
+    }
+
+    pub fn is_using_gpu(&self) -> bool {
+        self.0.is_using_gpu()
     }
 }
