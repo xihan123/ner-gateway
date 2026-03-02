@@ -43,8 +43,7 @@ target/
 *.db-wal
 
 # Model files (large)
-models/*.onnx
-models/best_ner_model/
+models/
 
 # Logs
 *.log
@@ -58,6 +57,9 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+*.dll
+*.lib
+*.pdb
 
 # Temporary files
 *.tmp
@@ -66,3 +68,7 @@ Thumbs.db
 
 # Test outputs
 test_output/
+
+# data set
+processed_data/
+raw_data/
