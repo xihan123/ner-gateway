@@ -349,6 +349,10 @@ jobs:
           - Windows x64 (CUDA): https://github.com/microsoft/onnxruntime/releases/download/v${{ env.ONNX_RUNTIME_VERSION }}/onnxruntime-win-x64-gpu-${{ env.ONNX_RUNTIME_VERSION }}.zip
           - Linux x64 (CUDA): https://github.com/microsoft/onnxruntime/releases/download/v${{ env.ONNX_RUNTIME_VERSION }}/onnxruntime-linux-x64-gpu-${{ env.ONNX_RUNTIME_VERSION }}.tgz
 
+          **CUDA 依赖下载**（使用 GPU 版本必需）：
+          - CUDA Toolkit: https://developer.nvidia.com/cuda-downloads
+          - cuDNN: https://developer.nvidia.com/cudnn-downloads
+
           ### 校验
 
           ```bash
