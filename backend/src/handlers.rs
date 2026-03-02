@@ -1,5 +1,3 @@
-//! API handlers
-
 use axum::{
     extract::{Path, Query, State},
     http::header,
@@ -13,20 +11,17 @@ use crate::db::{hash_text, NewReviewData, RepositorySync, ReviewData, ReviewFilt
 use crate::engine::NEREngineSync;
 use crate::error::{AppError, Result};
 
-/// Application state
 #[derive(Clone)]
 pub struct AppState {
     pub engine: NEREngineSync,
     pub repo: RepositorySync,
 }
 
-/// Extract request body
 #[derive(Debug, Deserialize)]
 pub struct ExtractRequest {
     pub text: String,
 }
 
-/// Extract response
 #[derive(Debug, Serialize)]
 pub struct ExtractResponse {
     pub names: Vec<String>,
@@ -37,7 +32,28 @@ pub struct ExtractResponse {
     pub is_duplicate: Option<bool>,
 }
 
-/// Review item for API response
+#[derive(Debug, Deserialize)]
+pub struct BatchExtractRequest {
+    pub texts: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchExtractItem {
+    pub text: String,
+    pub names: Vec<String>,
+    pub confidence: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_duplicate: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchExtractResponse {
+    pub count: usize,
+    pub results: Vec<BatchExtractItem>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ReviewItem {
     pub id: i64,
@@ -64,7 +80,6 @@ impl From<ReviewData> for ReviewItem {
     }
 }
 
-/// Review update request
 #[derive(Debug, Deserialize)]
 pub struct ReviewUpdateRequest {
     pub action: String,
@@ -74,15 +89,11 @@ pub struct ReviewUpdateRequest {
     pub note: Option<String>,
 }
 
-/// Query parameters for reviews list
 #[derive(Debug, Deserialize)]
 pub struct ReviewsQuery {
     pub status: Option<String>,
-    /// Minimum confidence (0.0 - 1.0)
     pub confidence_min: Option<f64>,
-    /// Maximum confidence (0.0 - 1.0)
     pub confidence_max: Option<f64>,
-    /// Filter by whether names were extracted (true = has names, false = no names)
     pub has_names: Option<bool>,
     #[serde(default = "default_limit")]
     pub limit: usize,
@@ -90,17 +101,13 @@ pub struct ReviewsQuery {
     pub offset: usize,
 }
 
-fn default_limit() -> usize {
-    100
-}
+fn default_limit() -> usize { 100 }
 
-/// Query parameters for export
 #[derive(Debug, Deserialize)]
 pub struct ExportQuery {
     pub format: Option<String>,
 }
 
-/// POST /api/extract - Extract names from text
 pub async fn extract(
     State(state): State<AppState>,
     Json(req): Json<ExtractRequest>,
@@ -114,7 +121,6 @@ pub async fn extract(
     let text_hash = hash_text(text);
     let repo = state.repo.inner();
     
-    // Check if already exists
     if let Some(existing) = repo.find_by_hash(&text_hash)? {
         return Ok(Json(ExtractResponse {
             names: existing.predicted_names,
@@ -124,10 +130,8 @@ pub async fn extract(
         }));
     }
     
-    // Run inference
     let result = state.engine.predict(text)?;
     
-    // Save to database
     let new_review = NewReviewData {
         original_text: text.to_string(),
         text_hash,
@@ -145,7 +149,72 @@ pub async fn extract(
     }))
 }
 
-/// GET /api/reviews - Get pending reviews (backward compatible)
+pub async fn batch_extract(
+    State(state): State<AppState>,
+    Json(req): Json<BatchExtractRequest>,
+) -> Result<Json<BatchExtractResponse>> {
+    if req.texts.is_empty() {
+        return Err(AppError::BadRequest("texts cannot be empty".into()));
+    }
+
+    if req.texts.len() > 100 {
+        return Err(AppError::BadRequest("batch size cannot exceed 100".into()));
+    }
+
+    let repo = state.repo.inner();
+    let mut results = Vec::with_capacity(req.texts.len());
+
+    for text in req.texts {
+        let trimmed = text.trim();
+
+        if trimmed.is_empty() {
+            results.push(BatchExtractItem {
+                text: text.clone(),
+                names: vec![],
+                confidence: 1.0,
+                review_id: None,
+                is_duplicate: None,
+            });
+            continue;
+        }
+
+        let text_hash = hash_text(trimmed);
+
+        if let Some(existing) = repo.find_by_hash(&text_hash)? {
+            results.push(BatchExtractItem {
+                text: trimmed.to_string(),
+                names: existing.predicted_names,
+                confidence: existing.confidence,
+                review_id: Some(existing.id),
+                is_duplicate: Some(true),
+            });
+            continue;
+        }
+
+        let result = state.engine.predict(trimmed)?;
+
+        let new_review = NewReviewData {
+            original_text: trimmed.to_string(),
+            text_hash,
+            predicted_names: result.names.clone(),
+            confidence: result.confidence,
+        };
+
+        let (review, _) = repo.create_if_not_exists(&new_review)?;
+
+        results.push(BatchExtractItem {
+            text: trimmed.to_string(),
+            names: result.names,
+            confidence: result.confidence,
+            review_id: Some(review.id),
+            is_duplicate: Some(false),
+        });
+    }
+
+    let count = results.len();
+    Ok(Json(BatchExtractResponse { count, results }))
+}
+
 pub async fn get_reviews(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
     let reviews = state.repo.inner().get_pending(50)?;
     let items: Vec<ReviewItem> = reviews.into_iter().map(ReviewItem::from).collect();
@@ -156,12 +225,10 @@ pub async fn get_reviews(State(state): State<AppState>) -> Result<Json<serde_jso
     })))
 }
 
-/// GET /api/reviews/filter - Get reviews with advanced filtering
 pub async fn get_filtered_reviews(
     State(state): State<AppState>,
     Query(query): Query<ReviewsQuery>,
 ) -> Result<Json<serde_json::Value>> {
-    // Validate and clamp limit
     let limit = query.limit.min(500).max(1);
     let offset = query.offset;
     
@@ -176,8 +243,6 @@ pub async fn get_filtered_reviews(
     
     let reviews = state.repo.inner().get_filtered(&filter)?;
     let items: Vec<ReviewItem> = reviews.into_iter().map(ReviewItem::from).collect();
-    
-    // Get total count for pagination info
     let total_count = state.repo.inner().count_filtered(&filter)?;
     
     Ok(Json(serde_json::json!({
@@ -190,20 +255,16 @@ pub async fn get_filtered_reviews(
     })))
 }
 
-/// GET /api/reviews/all - Get all reviews
 pub async fn get_all_reviews(
     State(state): State<AppState>,
     Query(query): Query<ReviewsQuery>,
 ) -> Result<Json<serde_json::Value>> {
-    // Validate and clamp limit
     let limit = query.limit.min(500).max(1);
     let offset = query.offset;
     
     let status = query.status.and_then(|s| ReviewStatus::from_str(&s));
     let reviews = state.repo.inner().get_all(status, limit)?;
     let items: Vec<ReviewItem> = reviews.into_iter().map(ReviewItem::from).collect();
-    
-    // Get total count for pagination info
     let total_count = state.repo.inner().count_all(status)?;
     
     Ok(Json(serde_json::json!({
@@ -216,7 +277,6 @@ pub async fn get_all_reviews(
     })))
 }
 
-/// POST /api/reviews/:id - Update review
 pub async fn update_review(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -224,7 +284,6 @@ pub async fn update_review(
 ) -> Result<Json<serde_json::Value>> {
     let repo = state.repo.inner();
     
-    // Find review
     let review = repo
         .find_by_id(id)?
         .ok_or_else(|| AppError::NotFound("review not found".into()))?;
@@ -233,12 +292,9 @@ pub async fn update_review(
         return Err(AppError::BadRequest("review already processed".into()));
     }
     
-    // Parse action
     let (status, corrected_names) = match req.action.as_str() {
         "approve" => (ReviewStatus::Approved, Some(review.predicted_names.as_slice())),
-        "correct" => {
-            (ReviewStatus::Corrected, Some(req.names.as_slice()))
-        }
+        "correct" => (ReviewStatus::Corrected, Some(req.names.as_slice())),
         "reject" => (ReviewStatus::Rejected, None),
         _ => return Err(AppError::BadRequest("invalid action: must be approve, correct, or reject".into())),
     };
@@ -252,20 +308,17 @@ pub async fn update_review(
     })))
 }
 
-/// GET /api/stats - Get statistics
 pub async fn get_stats(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
     let stats = state.repo.inner().get_stats()?;
     Ok(Json(stats))
 }
 
-/// GET /api/export - Export training data
 pub async fn export_data(
     State(state): State<AppState>,
     Query(query): Query<ExportQuery>,
 ) -> Result<Response> {
     let reviews = state.repo.inner().get_export_data()?;
     
-    // Convert to BIO format
     let export_items: Vec<serde_json::Value> = reviews
         .iter()
         .map(|r| {
@@ -285,7 +338,6 @@ pub async fn export_data(
         .collect();
     
     if query.format.as_deref() == Some("jsonl") || query.format.as_deref() == Some("bio") {
-        // Return JSONL format
         let body = export_items
             .iter()
             .map(|item| serde_json::to_string(item).unwrap_or_default())
@@ -295,17 +347,13 @@ pub async fn export_data(
         return Ok((
             [
                 (header::CONTENT_TYPE, "application/x-ndjson"),
-                (
-                    header::CONTENT_DISPOSITION,
-                    "attachment; filename=training_data.jsonl",
-                ),
+                (header::CONTENT_DISPOSITION, "attachment; filename=training_data.jsonl"),
             ],
             body,
         )
             .into_response());
     }
     
-    // Default JSON response
     Ok(Json(serde_json::json!({
         "count": export_items.len(),
         "data": export_items
@@ -313,7 +361,6 @@ pub async fn export_data(
     .into_response())
 }
 
-/// GET /health - Health check
 pub async fn health_check(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
     let repo = state.repo.inner();
     let db_status = match repo.get_stats() {
@@ -334,34 +381,39 @@ pub async fn health_check(State(state): State<AppState>) -> Result<Json<serde_js
     })))
 }
 
-/// Check if a name is valid (contains non-whitespace, non-punctuation characters)
+pub async fn gpu_status(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
+    let using_gpu = state.engine.is_using_gpu();
+
+    Ok(Json(serde_json::json!({
+        "gpu_enabled": using_gpu,
+        "device": if using_gpu { "GPU" } else { "CPU" },
+        "message": if using_gpu {
+            "GPU acceleration is active"
+        } else {
+            "Running on CPU. For GPU support, use static quantization or FP16 model."
+        }
+    })))
+}
+
 fn is_valid_name(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    
     name.chars().any(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
 }
 
-/// Clean name by removing whitespace and invalid characters
 fn clean_name_for_bio(name: &str) -> String {
     name.chars()
         .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
         .collect()
 }
 
-/// Convert text and names to BIO tags
 fn text_to_bio_tags(text: &str, names: &[String]) -> (Vec<String>, Vec<String>) {
-    // Clean HTML tags
     let clean_text = clean_html(text);
-    
-    // Tokenize: each character as a token
     let tokens: Vec<char> = clean_text.chars().collect();
     let mut labels = vec!["O"; tokens.len()];
     
-    // Set BIO tags for each name
     for name in names {
-        // Clean and validate name
         let cleaned_name = clean_name_for_bio(name);
         if !is_valid_name(&cleaned_name) {
             continue;
@@ -372,7 +424,6 @@ fn text_to_bio_tags(text: &str, names: &[String]) -> (Vec<String>, Vec<String>) 
             continue;
         }
         
-        // Find name in text
         for i in 0..=(tokens.len().saturating_sub(name_chars.len())) {
             let match_found = name_chars
                 .iter()
@@ -394,7 +445,6 @@ fn text_to_bio_tags(text: &str, names: &[String]) -> (Vec<String>, Vec<String>) 
     (token_strs, label_strs)
 }
 
-/// Remove HTML tags
 fn clean_html(text: &str) -> String {
     let re = Regex::new(r"<[^>]+>").unwrap();
     re.replace_all(text, "").trim().to_string()
