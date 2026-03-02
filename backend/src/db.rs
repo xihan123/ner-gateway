@@ -1,5 +1,4 @@
-//! Database models and repository
-
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +8,8 @@ use sha2::{Digest, Sha256};
 
 use crate::error::Result;
 
-/// Review status enum
+const HASH_CACHE_MAX_SIZE: usize = 100_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReviewStatus {
@@ -56,7 +56,6 @@ impl rusqlite::types::FromSql for ReviewStatus {
     }
 }
 
-/// Review data model
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReviewData {
     pub id: i64,
@@ -86,8 +85,7 @@ impl ReviewData {
             predicted_names: serde_json::from_str(&predicted_names_str).unwrap_or_default(),
             status: row.get(5)?,
             review_note: row.get(6)?,
-            corrected_names: corrected_names_str
-                .and_then(|s| serde_json::from_str(&s).ok()),
+            corrected_names: corrected_names_str.and_then(|s| serde_json::from_str(&s).ok()),
             created_at: DateTime::parse_from_rfc3339(&created_at_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now()),
@@ -98,24 +96,31 @@ impl ReviewData {
     }
 }
 
-/// Compute SHA256 hash of text
 pub fn hash_text(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.trim().as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
-/// Database repository (thread-safe)
 pub struct Repository {
     conn: Mutex<Connection>,
+    hash_cache: Mutex<HashSet<String>>,
 }
 
 impl Repository {
-    /// Create a new repository with database connection
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
+
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            PRAGMA cache_size=-64000;
+            PRAGMA temp_store=MEMORY;
+            PRAGMA journal_size_limit=104857600;
+            "#,
+        )?;
         
-        // Create table if not exists
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS review_data (
@@ -135,13 +140,46 @@ impl Repository {
             CREATE INDEX IF NOT EXISTS idx_text_hash ON review_data(text_hash);
             "#,
         )?;
-        
-        tracing::info!("Database initialized");
-        
-        Ok(Self { conn: Mutex::new(conn) })
+
+        let mut hash_cache = HashSet::new();
+        {
+            let mut stmt = conn.prepare("SELECT text_hash FROM review_data")?;
+            let hashes: Vec<String> = stmt
+                .query_map([], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            for hash in hashes {
+                hash_cache.insert(hash);
+            }
+        }
+
+        tracing::info!("Database initialized with WAL mode, {} hashes cached", hash_cache.len());
+
+        Ok(Self {
+            conn: Mutex::new(conn),
+            hash_cache: Mutex::new(hash_cache),
+        })
+    }
+
+    fn is_hash_cached(&self, hash: &str) -> bool {
+        let cache = self.hash_cache.lock().unwrap();
+        cache.contains(hash)
+    }
+
+    fn cache_hash(&self, hash: String) {
+        let mut cache = self.hash_cache.lock().unwrap();
+
+        if cache.len() >= HASH_CACHE_MAX_SIZE {
+            let to_remove: Vec<String> = cache.iter().take(cache.len() / 2).cloned().collect();
+            for h in to_remove {
+                cache.remove(&h);
+            }
+            tracing::warn!("Hash cache reached max size, evicted {} entries", cache.len() / 2);
+        }
+
+        cache.insert(hash);
     }
     
-    /// Find review by text hash
     pub fn find_by_hash(&self, hash: &str) -> Result<Option<ReviewData>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -156,8 +194,8 @@ impl Repository {
             Err(e) => Err(e.into()),
         }
     }
-    
-    /// Create a new review record
+
+    #[allow(dead_code)]
     pub fn create(&self, data: &NewReviewData) -> Result<i64> {
         let predicted_names = serde_json::to_string(&data.predicted_names)?;
         let now = Utc::now();
@@ -180,20 +218,53 @@ impl Repository {
         Ok(conn.last_insert_rowid())
     }
     
-    /// Create if not exists, returns (review, is_new)
     pub fn create_if_not_exists(&self, data: &NewReviewData) -> Result<(ReviewData, bool)> {
-        // Check if exists
-        if let Some(existing) = self.find_by_hash(&data.text_hash)? {
+        if self.is_hash_cached(&data.text_hash) {
+            let existing = self.find_by_hash(&data.text_hash)?.unwrap();
             return Ok((existing, false));
         }
-        
-        // Create new
-        let id = self.create(data)?;
-        let review = self.find_by_id(id)?.unwrap();
-        Ok((review, true))
+
+        let predicted_names = serde_json::to_string(&data.predicted_names)?;
+        let now = Utc::now();
+        let conn = self.conn.lock().unwrap();
+
+        let result = conn.execute(
+            "INSERT INTO review_data (original_text, text_hash, confidence, predicted_names, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(text_hash) DO NOTHING",
+            params![
+                data.original_text,
+                data.text_hash,
+                data.confidence,
+                predicted_names,
+                ReviewStatus::Pending,
+                now.to_rfc3339(),
+                now.to_rfc3339(),
+            ],
+        );
+
+        match result {
+            Ok(rows_affected) => {
+                if rows_affected > 0 {
+                    let id = conn.last_insert_rowid();
+                    drop(conn);
+
+                    self.cache_hash(data.text_hash.clone());
+                    let review = self.find_by_id(id)?.unwrap();
+                    Ok((review, true))
+                } else {
+                    let hash = data.text_hash.clone();
+                    drop(conn);
+
+                    self.cache_hash(hash);
+                    let existing = self.find_by_hash(&data.text_hash)?.unwrap();
+                    Ok((existing, false))
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
     }
     
-    /// Find by ID
     pub fn find_by_id(&self, id: i64) -> Result<Option<ReviewData>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -209,7 +280,6 @@ impl Repository {
         }
     }
     
-    /// Get pending reviews
     pub fn get_pending(&self, limit: usize) -> Result<Vec<ReviewData>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -225,7 +295,6 @@ impl Repository {
         Ok(reviews)
     }
     
-    /// Get all reviews with optional filter
     pub fn get_all(&self, status: Option<ReviewStatus>, limit: usize) -> Result<Vec<ReviewData>> {
         let conn = self.conn.lock().unwrap();
         
@@ -248,7 +317,6 @@ impl Repository {
         Ok(reviews)
     }
     
-    /// Count all reviews with optional status filter
     pub fn count_all(&self, status: Option<ReviewStatus>) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         
@@ -265,7 +333,6 @@ impl Repository {
         Ok(count as usize)
     }
     
-    /// Get filtered reviews with advanced filtering options
     pub fn get_filtered(&self, filter: &ReviewFilter) -> Result<Vec<ReviewData>> {
         let conn = self.conn.lock().unwrap();
         
@@ -274,13 +341,11 @@ impl Repository {
         );
         let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         
-        // Status filter
         if let Some(status) = &filter.status {
             sql.push_str(" AND status = ?");
             param_values.push(Box::new(status.as_str().to_string()));
         }
         
-        // Confidence range filter
         if let Some(min) = filter.confidence_min {
             sql.push_str(" AND confidence >= ?");
             param_values.push(Box::new(min));
@@ -290,13 +355,10 @@ impl Repository {
             param_values.push(Box::new(max));
         }
         
-        // Has names filter (check if predicted_names is not empty array)
         if let Some(has_names) = filter.has_names {
             if has_names {
-                // Has names: predicted_names is not '[]'
                 sql.push_str(" AND predicted_names != '[]' AND predicted_names IS NOT NULL");
             } else {
-                // No names: predicted_names is '[]' or NULL
                 sql.push_str(" AND (predicted_names = '[]' OR predicted_names IS NULL)");
             }
         }
@@ -315,20 +377,17 @@ impl Repository {
         Ok(reviews)
     }
     
-    /// Get count of filtered reviews (for pagination)
     pub fn count_filtered(&self, filter: &ReviewFilter) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         
         let mut sql = String::from("SELECT COUNT(*) FROM review_data WHERE 1=1");
         let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         
-        // Status filter
         if let Some(status) = &filter.status {
             sql.push_str(" AND status = ?");
             param_values.push(Box::new(status.as_str().to_string()));
         }
         
-        // Confidence range filter
         if let Some(min) = filter.confidence_min {
             sql.push_str(" AND confidence >= ?");
             param_values.push(Box::new(min));
@@ -338,7 +397,6 @@ impl Repository {
             param_values.push(Box::new(max));
         }
         
-        // Has names filter
         if let Some(has_names) = filter.has_names {
             if has_names {
                 sql.push_str(" AND predicted_names != '[]' AND predicted_names IS NOT NULL");
@@ -354,7 +412,6 @@ impl Repository {
         Ok(count as usize)
     }
     
-    /// Update review status
     pub fn update_status(
         &self,
         id: i64,
@@ -374,7 +431,6 @@ impl Repository {
         Ok(())
     }
     
-    /// Get statistics
     pub fn get_stats(&self) -> Result<serde_json::Value> {
         let conn = self.conn.lock().unwrap();
         let total: i64 = conn.query_row("SELECT COUNT(*) FROM review_data", [], |r| r.get(0))?;
@@ -392,7 +448,6 @@ impl Repository {
         }))
     }
     
-    /// Get export data (approved and corrected)
     pub fn get_export_data(&self) -> Result<Vec<ReviewData>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -409,7 +464,6 @@ impl Repository {
     }
 }
 
-/// New review data for insertion
 pub struct NewReviewData {
     pub original_text: String,
     pub text_hash: String,
@@ -417,7 +471,6 @@ pub struct NewReviewData {
     pub confidence: f64,
 }
 
-/// Filter options for reviewing queries
 #[derive(Debug, Clone, Default)]
 pub struct ReviewFilter {
     pub status: Option<ReviewStatus>,
@@ -428,7 +481,6 @@ pub struct ReviewFilter {
     pub offset: usize,
 }
 
-/// Thread-safe repository wrapper
 #[derive(Clone)]
 pub struct RepositorySync(Arc<Repository>);
 
