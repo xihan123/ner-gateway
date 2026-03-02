@@ -1,8 +1,3 @@
-//! NER Gateway - Rust implementation
-//! 
-//! A Named Entity Recognition inference gateway with ONNX Runtime,
-//! SQLite persistence, and REST API endpoints.
-
 mod config;
 mod db;
 mod engine;
@@ -27,18 +22,8 @@ use crate::db::{Repository, RepositorySync};
 use crate::engine::{NEREngine, NEREngineSync};
 use crate::handlers::AppState;
 
-/// Find index.html in multiple possible locations
-/// Priority:
-/// 1. ./index.html (Docker container: /app/index.html, or running from backend dir)
-/// 2. backend/index.html (Running from project root)
-/// 3. ../index.html (Running from backend/target/debug dir during development)
 fn find_static_files_dir() -> &'static str {
-    // Try multiple paths in order
-    let candidates = [
-        "./index.html",           // Docker or running from backend/
-        "backend/index.html",     // Running from project root
-        "../index.html",          // Running from backend/target/debug/
-    ];
+    let candidates = ["./index.html", "backend/index.html", "../index.html"];
     
     for path in candidates {
         if Path::new(path).exists() {
@@ -48,14 +33,12 @@ fn find_static_files_dir() -> &'static str {
         }
     }
     
-    // Default to current directory (Docker default)
     tracing::warn!("index.html not found, using default path: ./");
     "."
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -64,46 +47,37 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
     
-    // Load configuration
     let config = Config::from_env();
-    tracing::info!("Configuration: {:?}", config);
+    tracing::info!("Config: {:?}", config);
     
-    // Initialize NER engine
-    tracing::info!("Initializing NER engine...");
     let engine = NEREngine::new(&config.model_path, &config.vocab_path)?;
     let engine_sync = NEREngineSync::new(engine);
     
-    // Initialize database
-    tracing::info!("Initializing database...");
     let repo = Repository::new(&config.db_path)?;
     let repo_sync = RepositorySync::new(repo);
     
-    // Create app state
     let state = AppState {
         engine: engine_sync,
         repo: repo_sync,
     };
     
-    // Find static files directory (compatible with Docker, project root, and backend dir)
     let static_dir = find_static_files_dir();
     
-    // Build router
     let app = Router::new()
-        // API routes
         .route("/api/extract", post(handlers::extract))
+        .route("/api/extract/batch", post(handlers::batch_extract))
         .route("/api/reviews", get(handlers::get_reviews))
         .route("/api/reviews/filter", get(handlers::get_filtered_reviews))
         .route("/api/reviews/all", get(handlers::get_all_reviews))
         .route("/api/reviews/{id}", post(handlers::update_review))
         .route("/api/stats", get(handlers::get_stats))
         .route("/api/export", get(handlers::export_data))
+        .route("/api/gpu", get(handlers::gpu_status))
         .route("/health", get(handlers::health_check))
-        // Static files - serve index.html for root and fallback for SPA
         .fallback_service(
             ServeDir::new(static_dir)
                 .fallback(ServeFile::new(format!("{}/index.html", static_dir)))
         )
-        // Layers
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -113,9 +87,8 @@ async fn main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     
-    // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    tracing::info!("Server starting on {}", addr);
+    tracing::info!("Listening on {}", addr);
     
     let listener = tokio::net::TcpListener::bind(addr).await?;
     
@@ -126,11 +99,9 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
     
-    tracing::info!("Server stopped");
     Ok(())
 }
 
-/// Graceful shutdown signal
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -153,6 +124,4 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
-    
-    tracing::info!("Shutdown signal received");
 }
