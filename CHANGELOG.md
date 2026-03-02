@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/xihan123/ner-gateway/compare/v1.4.0...v1.4.1) (2026-03-02)
+
+
+### Bug Fixes
+
+* **config:** 更新模型路径配置 ([64d6431](https://github.com/xihan123/ner-gateway/commit/64d64313e83316895d84b9c12e34869a4975eaa7))
+
 ## [1.4.0](https://github.com/xihan123/ner-gateway/compare/v1.3.0...v1.4.0) (2026-03-02)
 
 
