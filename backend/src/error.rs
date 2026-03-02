@@ -1,5 +1,3 @@
-//! Error types
-
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -8,7 +6,6 @@ use axum::{
 use serde_json::json;
 use thiserror::Error;
 
-/// Application error type
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("IO error: {0}")]
@@ -49,5 +46,4 @@ impl IntoResponse for AppError {
     }
 }
 
-/// Result type alias
 pub type Result<T> = std::result::Result<T, AppError>;
