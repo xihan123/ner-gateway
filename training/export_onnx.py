@@ -1,243 +1,187 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-ONNX 导出与量化脚本
-将微调后的 NER 模型导出为 ONNX 格式并进行 INT8 动态量化
-"""
-
+import argparse
+import shutil
 from pathlib import Path
 
-import numpy as np
-import onnxruntime as ort
-import torch
-from transformers import AutoModelForTokenClassification, AutoTokenizer
+import onnx
+from datasets import Dataset
+from onnxruntime.transformers.float16 import convert_float_to_float16
+from optimum.onnxruntime import ORTModelForTokenClassification, ORTQuantizer
+from optimum.onnxruntime.configuration import (
+    AutoQuantizationConfig,
+    CalibrationConfig,
+    CalibrationMethod,
+)
+from transformers import AutoTokenizer, pipeline
 
-# ===================== 配置 =====================
 MODEL_DIR = "../models/best_ner_model"
-ONNX_OUTPUT = "../models/ner_model.onnx"
-ONNX_INT8_OUTPUT = "../models/ner_model_int8.onnx"
+ONNX_OUTPUT_DIR = "../models/onnx_ner_model"
+ONNX_INT8_OUTPUT_DIR = "../models/onnx_ner_model_int8"
+ONNX_FP16_OUTPUT_DIR = "../models/onnx_ner_model_fp16"
 VOCAB_OUTPUT = "../models/vocab.txt"
-MAX_LENGTH = 512
 
-# 标签映射（与训练脚本一致）
-LABEL_LIST = ["O", "B-PER", "I-PER"]
+CALIBRATION_SAMPLES = [
+    "张三今天在北京开会，见到了李四。",
+    "王五打电话给赵六，说明天要去上海。",
+    "请问您是陈先生吗？我是客服小李。",
+    "您好，我是刘经理，这是我的名片。",
+    "欧阳明和王小明一起去了公司。",
+]
 
 
 def resolve_path(relative_path: str) -> Path:
-	"""将相对于脚本目录的路径解析为绝对路径"""
-	script_dir = Path(__file__).parent
-	return (script_dir / relative_path).resolve()
-
-
-def validate_model_dir(model_dir: str) -> None:
-	"""
-	验证模型目录是否包含有效的模型文件
-	检查 model.safetensors 或 pytorch_model.bin 是否存在且非空
-	"""
-	model_path = resolve_path(model_dir)
-	
-	if not model_path.exists():
-		raise FileNotFoundError(f"模型目录不存在: {model_path}")
-	
-	# 检查必要的配置文件
-	config_file = model_path / "config.json"
-	if not config_file.exists():
-		raise FileNotFoundError(f"配置文件不存在: {config_file}")
-	if config_file.stat().st_size == 0:
-		raise ValueError(f"配置文件为空: {config_file}")
-	
-	# 检查模型权重文件
-	safetensors_file = model_path / "model.safetensors"
-	pytorch_model_file = model_path / "pytorch_model.bin"
-	
-	if safetensors_file.exists():
-		file_size = safetensors_file.stat().st_size
-		if file_size == 0:
-			raise ValueError(
-				f"模型文件为空 (0 字节): {safetensors_file}\n"
-				f"请重新训练模型: uv run python training/train.py"
-			)
-		print(f"  - 模型目录: {model_path}")
-		print(f"  - 找到模型文件: model.safetensors ({file_size / 1024 / 1024:.2f} MB)")
-	elif pytorch_model_file.exists():
-		file_size = pytorch_model_file.stat().st_size
-		if file_size == 0:
-			raise ValueError(
-				f"模型文件为空 (0 字节): {pytorch_model_file}\n"
-				f"请重新训练模型: uv run python training/train.py"
-			)
-		print(f"  - 模型目录: {model_path}")
-		print(f"  - 找到模型文件: pytorch_model.bin ({file_size / 1024 / 1024:.2f} MB)")
-	else:
-		raise FileNotFoundError(
-			f"未找到模型权重文件 (model.safetensors 或 pytorch_model.bin)\n"
-			f"模型目录: {model_path}\n"
-			f"请先训练模型: uv run python training/train.py"
-		)
+    return (Path(__file__).parent / relative_path).resolve()
 
 
 def export_vocab(tokenizer, output_path: str):
-	"""
-	导出词汇表为 vocab.txt 格式
-	格式：每行一个 token，行号即为对应的 token ID
-	"""
-	vocab = tokenizer.get_vocab()
-	# 按ID排序
-	sorted_vocab = sorted(vocab.items(), key=lambda x: x[1])
-
-	with open(output_path, "w", encoding="utf-8") as f:
-		for token, token_id in sorted_vocab:
-			f.write(f"{token}\n")
-
-	print(f"  - 词汇表已保存: {output_path}")
-	print(f"  - 词汇表大小: {len(sorted_vocab)}")
+    vocab = sorted(tokenizer.get_vocab().items(), key=lambda x: x[1])
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.writelines(f"{token}\n" for token, _ in vocab)
 
 
-def export_onnx():
-	"""导出 PyTorch 模型为 ONNX 格式"""
-	print("=" * 50)
-	print("ONNX 导出与量化")
-	print("=" * 50)
+def export_static_quantized(quantizer, tokenizer, onnx_int8_output):
+    def preprocess(examples):
+        return tokenizer(examples["text"], max_length=128, padding="max_length", truncation=True)
 
-	# 解析绝对路径
-	model_dir = resolve_path(MODEL_DIR)
-	onnx_output = resolve_path(ONNX_OUTPUT)
-	onnx_int8_output = resolve_path(ONNX_INT8_OUTPUT)
-	vocab_output = resolve_path(VOCAB_OUTPUT)
+    calibration_dataset = (
+        Dataset.from_dict({"text": CALIBRATION_SAMPLES})
+        .map(preprocess, batched=True)
+        .remove_columns(["text"])
+    )
+    calibration_dataset.set_format(type="np")
 
-	# 1. 验证模型文件
-	print("\n[1/6] 验证模型文件...")
-	validate_model_dir(MODEL_DIR)
+    calibration_config = CalibrationConfig(
+        dataset_name="custom",
+        dataset_config_name="default",
+        dataset_split="train",
+        dataset_num_samples=len(CALIBRATION_SAMPLES),
+        method=CalibrationMethod.MinMax,
+    )
 
-	# 2. 加载模型和 Tokenizer
-	print("\n[2/6] 加载模型...")
-	tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
-	model = AutoModelForTokenClassification.from_pretrained(str(model_dir))
-	model.eval()
+    calibration_tensors_range = quantizer.fit(
+        dataset=calibration_dataset,
+        calibration_config=calibration_config,
+    )
 
-	print(f"  - 模型路径: {model_dir}")
-	print(f"  - 标签数: {model.config.num_labels}")
-
-	# 3. 构造 dummy input 并导出 ONNX
-	print("\n[3/6] 导出 ONNX 模型...")
-
-	# 创建示例输入（支持动态 batch_size 和 sequence_length）
-	dummy_text = "这是一个测试句子"
-	dummy_inputs = tokenizer(
-		dummy_text,
-		return_tensors="pt",
-		padding="max_length",
-		truncation=True,
-		max_length=MAX_LENGTH,
-	)
-
-	# 输入名称
-	input_names = ["input_ids", "attention_mask", "token_type_ids"]
-	output_names = ["logits"]
-
-	# 动态轴配置：支持不同的 batch_size 和 sequence_length
-	dynamic_axes = {
-		"input_ids": {0: "batch_size", 1: "sequence_length"},
-		"attention_mask": {0: "batch_size", 1: "sequence_length"},
-		"token_type_ids": {0: "batch_size", 1: "sequence_length"},
-		"logits": {0: "batch_size", 1: "sequence_length"},
-	}
-
-	# 导出 ONNX（使用传统导出方式，确保权重完整导出）
-	torch.onnx.export(
-		model,
-		(dummy_inputs["input_ids"], dummy_inputs["attention_mask"], dummy_inputs["token_type_ids"]),
-		str(onnx_output),
-		input_names=input_names,
-		output_names=output_names,
-		dynamic_axes=dynamic_axes,
-		opset_version=14,
-		do_constant_folding=True,
-		dynamo=False,  # 使用传统导出方式
-	)
-	print(f"  - ONNX 模型已保存: {onnx_output}")
-
-	# 4. INT8 动态量化
-	print("\n[4/6] INT8 动态量化...")
-	from onnxruntime.quantization import quantize_dynamic, QuantType
-
-	quantize_dynamic(
-		model_input=str(onnx_output),
-		model_output=str(onnx_int8_output),
-		weight_type=QuantType.QInt8,  # 使用 QInt8 进行权重量化
-	)
-	print(f"  - INT8 量化模型已保存: {onnx_int8_output}")
-
-	# 5. 导出 vocab.txt
-	print("\n[5/6] 导出词汇表...")
-	export_vocab(tokenizer, str(vocab_output))
-
-	# 6. 验证量化模型
-	print("\n[6/6] 验证量化模型...")
-	test_onnx_model(str(onnx_int8_output), tokenizer)
-
-	# 打印模型大小对比
-	print("\n" + "=" * 50)
-	print("输出文件:")
-	original_size = onnx_output.stat().st_size / 1024 / 1024
-	quantized_size = onnx_int8_output.stat().st_size / 1024 / 1024
-	vocab_size_kb = vocab_output.stat().st_size / 1024
-	print(f"  - ONNX 模型: {onnx_output} ({original_size:.2f} MB)")
-	print(f"  - INT8 量化: {onnx_int8_output} ({quantized_size:.2f} MB)")
-	print(f"  - 词汇表: {vocab_output} ({vocab_size_kb:.1f} KB)")
-	print(f"  - 压缩比例: {original_size / quantized_size:.2f}x")
-	print("=" * 50)
+    qconfig = AutoQuantizationConfig.arm64(is_static=True, per_channel=False)
+    quantizer.quantize(
+        save_dir=str(onnx_int8_output),
+        quantization_config=qconfig,
+        calibration_tensors_range=calibration_tensors_range,
+    )
+    tokenizer.save_pretrained(str(onnx_int8_output))
+    print(f"INT8 静态量化: {onnx_int8_output}")
 
 
-def test_onnx_model(onnx_path: str, tokenizer):
-	"""测试 ONNX 模型推理"""
-	# 创建 ONNX Runtime 会话
-	sess_options = ort.SessionOptions()
-	sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+def export_fp16(ort_model, tokenizer, onnx_fp16_output):
+    model_path = ort_model.model_path
+    onnx_fp16_output.mkdir(parents=True, exist_ok=True)
 
-	session = ort.InferenceSession(
-		onnx_path,
-		sess_options,
-		providers=["CPUExecutionProvider"],
-	)
+    model = onnx.load(str(model_path))
+    model_fp16 = convert_float_to_float16(model, keep_io_types=True)
+    onnx.save(model_fp16, str(onnx_fp16_output / "model.onnx"))
 
-	# 测试句子
-	test_text = "张三在北京工作"
-	print(f"  - 测试句子: {test_text}")
+    tokenizer.save_pretrained(str(onnx_fp16_output))
+    for f in ["config.json", "special_tokens_map.json", "tokenizer_config.json", "tokenizer.json"]:
+        src = model_path.parent / f
+        if src.exists():
+            shutil.copy(src, onnx_fp16_output / f)
 
-	# Tokenize
-	inputs = tokenizer(
-		test_text,
-		return_tensors="np",
-		padding="max_length",
-		truncation=True,
-		max_length=MAX_LENGTH,
-	)
+    print(f"FP16 半精度: {onnx_fp16_output}")
 
-	# ONNX 推理
-	ort_inputs = {
-		"input_ids": inputs["input_ids"].astype(np.int64),
-		"attention_mask": inputs["attention_mask"].astype(np.int64),
-		"token_type_ids": inputs["token_type_ids"].astype(np.int64),
-	}
 
-	outputs = session.run(None, ort_inputs)
-	logits = outputs[0]  # shape: [1, seq_len, num_labels]
+def test_model(onnx_dir: Path, mode: str):
+    model_file = "model_quantized.onnx" if mode in ("static", "dynamic") else "model.onnx"
+    if not (onnx_dir / model_file).exists():
+        model_file = "model.onnx"
 
-	# 获取预测标签
-	predictions = np.argmax(logits, axis=-1)[0]
+    try:
+        model = ORTModelForTokenClassification.from_pretrained(str(onnx_dir), file_name=model_file)
+        tokenizer = AutoTokenizer.from_pretrained(str(onnx_dir))
+        ner_pipe = pipeline(
+            "token-classification",
+            model=model,
+            tokenizer=tokenizer,
+            aggregation_strategy="simple",
+            device="cpu",
+        )
+        results = ner_pipe("张三今天在北京开会，见到了李四。")
+        for r in results:
+            print(f"  {r['word']} -> {r['entity_group']} ({r['score']:.4f})")
+    except Exception as e:
+        print(f"  测试失败: {e}")
 
-	# 解码 tokens 并显示预测结果
-	tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
-	print(f"\n  - 预测结果:")
-	for token, pred_id in zip(tokens[:len(test_text) + 2], predictions[:len(test_text) + 2]):
-		if token not in ["[PAD]", "[CLS]", "[SEP]"]:
-			label = LABEL_LIST[pred_id]
-			print(f"    {token}: {label}")
 
-	print(f"\n  - Logits shape: {logits.shape}")
-	print(f"  - 模型转换成功！")
+def export_onnx(modes):
+    if "all" in modes:
+        modes = ["static", "fp16"]
+
+    model_dir = resolve_path(MODEL_DIR)
+    onnx_output = resolve_path(ONNX_OUTPUT_DIR)
+    onnx_int8_output = resolve_path(ONNX_INT8_OUTPUT_DIR)
+    onnx_fp16_output = resolve_path(ONNX_FP16_OUTPUT_DIR)
+    vocab_output = resolve_path(VOCAB_OUTPUT)
+
+    if not model_dir.exists():
+        raise FileNotFoundError(f"模型目录不存在: {model_dir}")
+
+    tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+    ort_model = ORTModelForTokenClassification.from_pretrained(str(model_dir), export=True)
+
+    tokenizer.save_pretrained(str(onnx_output))
+    ort_model.save_pretrained(str(onnx_output))
+    export_vocab(tokenizer, str(vocab_output))
+
+    orig_size = (onnx_output / "model.onnx").stat().st_size / 1024 / 1024
+    print(f"ONNX 原始模型: {orig_size:.2f} MB -> {onnx_output}")
+
+    quantizer = ORTQuantizer.from_pretrained(ort_model)
+
+    for mode in modes:
+        if mode == "static":
+            export_static_quantized(quantizer, tokenizer, onnx_int8_output)
+            model_file = onnx_int8_output / "model_quantized.onnx"
+        elif mode == "fp16":
+            export_fp16(ort_model, tokenizer, onnx_fp16_output)
+            model_file = onnx_fp16_output / "model.onnx"
+        else:
+            continue
+
+        if model_file.exists():
+            size = model_file.stat().st_size / 1024 / 1024
+            print(f"  压缩比: {orig_size / size:.2f}x ({size:.2f} MB)")
+            test_model(model_file.parent, mode)
+
+
+def analyze_ops(model_path: str):
+    model = onnx.load(model_path)
+    ops = {n.op_type for n in model.graph.node}
+
+    limited = ops & {"MatMulInteger", "DynamicQuantizeLinear", "DequantizeLinear"}
+    supported = ops & {"QLinearMatMul", "QLinearAdd", "QLinearConv", "MatMul", "Add", "Mul"}
+
+    print(f"算子类型: {len(ops)}")
+    print(f"CUDA 支持: {supported or '标准算子'}")
+    if limited:
+        print(f"CUDA 受限: {limited}")
 
 
 if __name__ == "__main__":
-	export_onnx()
+    parser = argparse.ArgumentParser(description="ONNX 模型导出与量化")
+    parser.add_argument(
+        "--mode", "-m",
+        nargs="+",
+        choices=["static", "fp16", "all"],
+        default=["static"],
+        help="量化模式",
+    )
+    parser.add_argument("--all", "-a", action="store_true", help="导出全部")
+    parser.add_argument("--analyze", action="store_true", help="分析算子")
+
+    args = parser.parse_args()
+
+    if args.analyze:
+        model_path = resolve_path(ONNX_INT8_OUTPUT_DIR) / "model_quantized.onnx"
+        analyze_ops(str(model_path)) if model_path.exists() else print("模型不存在")
+    else:
+        export_onnx(["all"] if args.all else args.mode)
